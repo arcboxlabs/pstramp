@@ -10,39 +10,36 @@ permissions:
 
 jobs:
   build:
-    name: Build (${{ matrix.target }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            runner: macos-latest
-          - target: x86_64-apple-darwin
-            runner: macos-13
+    name: Build
+    runs-on: macos-latest
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
 
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Build (arm64)
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Build (x86_64)
+        run: cargo build --release --target x86_64-apple-darwin
 
       - name: Package
         run: |
-          BIN="target/${{ matrix.target }}/release/pstramp"
-          ARCHIVE="pstramp-${GITHUB_REF_NAME}-${{ matrix.target }}"
-          cp "$BIN" "$ARCHIVE"
-          shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            BIN="target/$target/release/pstramp"
+            OUT="pstramp-${GITHUB_REF_NAME}-$target"
+            cp "$BIN" "$OUT"
+            shasum -a 256 "$OUT" > "$OUT.sha256"
+          done
 
       - uses: actions/upload-artifact@v4
         with:
-          name: pstramp-${{ matrix.target }}
+          name: pstramp-binaries
           path: |
-            pstramp-*-${{ matrix.target }}
-            pstramp-*-${{ matrix.target }}.sha256
+            pstramp-v*
 
   release:
     name: Create Release
