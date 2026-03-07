@@ -1,4 +1,4 @@
-//! pstramp — process spawn trampoline.
+//! pstramp — process spawn trampoline (no_std, macOS-only).
 //!
 //! Lightweight helper for process isolation. Performs optional session and
 //! controlling-terminal setup, then exec()s into the requested command.
@@ -14,177 +14,145 @@
 //! - `-setctty`  — Create a new session (`setsid`) and claim stdin as the
 //!   controlling terminal (`TIOCSCTTY`).
 //! - `-disclaim` — Use `posix_spawn` with `POSIX_SPAWN_DISCLAIM` to relinquish
-//!   the parent's responsibility claims (macOS only).
+//!   the parent's responsibility claims.
 
-use std::ffi::CString;
-use std::process::ExitCode;
+#![no_std]
+#![no_main]
+#![allow(unsafe_op_in_unsafe_fn)]
 
-/// macOS `POSIX_SPAWN_DISCLAIM` — relinquish parent responsibility claims.
-/// Available since macOS 13, not yet in the `libc` crate.
-#[cfg(target_os = "macos")]
-const POSIX_SPAWN_DISCLAIM: libc::c_short = 0x2000;
+#[cfg(not(target_os = "macos"))]
+compile_error!("pstramp is macOS-only");
 
-fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().collect();
+use core::ffi::{c_char, c_int, c_short, c_void};
+use core::ptr;
 
+// macOS ioctl request: _IO('t', 97) = 0x20007461
+const TIOCSCTTY: u64 = 0x2000_7461;
+
+// posix_spawn flags.
+const POSIX_SPAWN_SETEXEC: c_short = 0x0040;
+const POSIX_SPAWN_DISCLAIM: c_short = 0x2000;
+
+type SpawnAttr = *mut c_void;
+
+#[link(name = "System", kind = "dylib")]
+unsafe extern "C" {
+    fn setsid() -> c_int;
+    fn ioctl(fd: c_int, request: u64, ...) -> c_int;
+    fn execvp(file: *const c_char, argv: *const *const c_char) -> c_int;
+    fn write(fd: c_int, buf: *const u8, count: usize) -> isize;
+    fn strcmp(s1: *const c_char, s2: *const c_char) -> c_int;
+    fn strlen(s: *const c_char) -> usize;
+    fn exit(status: c_int) -> !;
+
+    fn posix_spawnattr_init(attr: *mut SpawnAttr) -> c_int;
+    fn posix_spawnattr_setflags(attr: *mut SpawnAttr, flags: c_short) -> c_int;
+    fn posix_spawnattr_destroy(attr: *mut SpawnAttr) -> c_int;
+    fn posix_spawn(
+        pid: *mut c_int,
+        path: *const c_char,
+        actions: *const c_void,
+        attr: *const SpawnAttr,
+        argv: *const *const c_char,
+        envp: *const *const c_char,
+    ) -> c_int;
+
+    fn _NSGetEnviron() -> *const *const *const c_char;
+}
+
+unsafe fn eputs(s: &[u8]) {
+    write(2, s.as_ptr(), s.len());
+}
+
+unsafe fn eput_cstr(s: *const c_char) {
+    write(2, s.cast(), strlen(s));
+}
+
+unsafe fn usage(argv0: *const c_char) {
+    eputs(b"usage: ");
+    eput_cstr(argv0);
+    eputs(b" [-setctty] [-disclaim] -- command [args...]\n");
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
     let mut do_setctty = false;
     let mut do_disclaim = false;
-    let mut cmd_start: Option<usize> = None;
+    let mut cmd_start: c_int = 0;
 
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--" => {
-                cmd_start = Some(i + 1);
-                break;
-            }
-            "-setctty" => do_setctty = true,
-            "-disclaim" => do_disclaim = true,
-            other => {
-                eprintln!("pstramp: unknown flag: {other}");
-                usage(&args[0]);
-                return ExitCode::from(2);
-            }
+    // Parse flags up to `--` separator.
+    let mut i: c_int = 1;
+    while i < argc {
+        let arg = *argv.offset(i as isize);
+        if strcmp(arg, c"--".as_ptr()) == 0 {
+            cmd_start = i + 1;
+            break;
+        } else if strcmp(arg, c"-setctty".as_ptr()) == 0 {
+            do_setctty = true;
+        } else if strcmp(arg, c"-disclaim".as_ptr()) == 0 {
+            do_disclaim = true;
+        } else {
+            eputs(b"pstramp: unknown flag: ");
+            eput_cstr(arg);
+            eputs(b"\n");
+            usage(*argv);
+            return 2;
         }
         i += 1;
     }
 
-    let cmd_start = match cmd_start {
-        Some(idx) if idx < args.len() => idx,
-        _ => {
-            usage(&args[0]);
-            return ExitCode::from(2);
-        }
-    };
+    if cmd_start == 0 || cmd_start >= argc {
+        usage(*argv);
+        return 2;
+    }
 
-    // -setctty: new session + controlling terminal.
+    let cmd_argv = argv.offset(cmd_start as isize);
+
+    // -setctty: new session + claim stdin as controlling terminal.
     if do_setctty {
-        if let Err(e) = setctty() {
-            eprintln!("pstramp: {e}");
-            return ExitCode::FAILURE;
+        if setsid() == -1 {
+            eputs(b"pstramp: setsid failed\n");
+            return 1;
+        }
+        if ioctl(0, TIOCSCTTY, 0 as c_int) == -1 {
+            eputs(b"pstramp: ioctl TIOCSCTTY failed\n");
+            return 1;
         }
     }
 
-    // -disclaim: posix_spawn with POSIX_SPAWN_DISCLAIM + POSIX_SPAWN_SETEXEC.
-    #[cfg(target_os = "macos")]
+    // -disclaim: posix_spawn with DISCLAIM | SETEXEC replaces current process.
     if do_disclaim {
-        let err = disclaim_exec(&args[cmd_start..]);
-        eprintln!("pstramp: {err}");
-        return ExitCode::FAILURE;
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    if do_disclaim {
-        eprintln!("pstramp: -disclaim is only supported on macOS");
-        return ExitCode::FAILURE;
-    }
-
-    // Default path: plain exec.
-    let err = exec(&args[cmd_start..]);
-    eprintln!("pstramp: exec {}: {err}", args[cmd_start]);
-    ExitCode::FAILURE
-}
-
-fn usage(argv0: &str) {
-    eprintln!("usage: {argv0} [-setctty] [-disclaim] -- command [args...]");
-}
-
-/// Create a new session and claim stdin as the controlling terminal.
-fn setctty() -> Result<(), String> {
-    // SAFETY: setsid is always safe; it only fails if already a session leader.
-    let ret = unsafe { libc::setsid() };
-    if ret == -1 {
-        return Err(format!("setsid: {}", std::io::Error::last_os_error()));
-    }
-
-    // SAFETY: TIOCSCTTY with arg 0 claims the terminal attached to stdin.
-    let ret =
-        unsafe { libc::ioctl(libc::STDIN_FILENO, u64::from(libc::TIOCSCTTY), 0) };
-    if ret == -1 {
-        return Err(format!(
-            "ioctl TIOCSCTTY: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-
-    Ok(())
-}
-
-/// Use `posix_spawn` with `POSIX_SPAWN_DISCLAIM | POSIX_SPAWN_SETEXEC` to
-/// replace the current process while relinquishing responsibility claims.
-#[cfg(target_os = "macos")]
-fn disclaim_exec(argv: &[String]) -> String {
-    let Ok(program) = to_cstring(&argv[0]) else {
-        return format!("program name contains nul: {}", argv[0]);
-    };
-    let c_args: Vec<CString> = match argv.iter().map(|a| to_cstring(a)).collect() {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let c_argv: Vec<*mut libc::c_char> = c_args
-        .iter()
-        .map(|s| s.as_ptr().cast_mut())
-        .chain(std::iter::once(std::ptr::null_mut()))
-        .collect();
-
-    let mut attr: libc::posix_spawnattr_t = std::ptr::null_mut();
-
-    // SAFETY: posix_spawnattr_init initializes the attribute object.
-    let ret = unsafe { libc::posix_spawnattr_init(&mut attr) };
-    if ret != 0 {
-        return format!("posix_spawnattr_init: {}", os_error(ret));
-    }
-
-    #[allow(clippy::cast_possible_truncation)]
-    let flags: libc::c_short = POSIX_SPAWN_DISCLAIM | libc::POSIX_SPAWN_SETEXEC as libc::c_short;
-
-    // SAFETY: Setting flags on a properly initialized attribute.
-    let ret = unsafe { libc::posix_spawnattr_setflags(&mut attr, flags) };
-    if ret != 0 {
-        unsafe { libc::posix_spawnattr_destroy(&mut attr) };
-        return format!("posix_spawnattr_setflags: {}", os_error(ret));
-    }
-
-    // SAFETY: posix_spawn with SETEXEC replaces the current process.
-    // _NSGetEnviron() returns the process environment pointer.
-    let ret = unsafe {
-        libc::posix_spawn(
-            std::ptr::null_mut(),
-            program.as_ptr(),
-            std::ptr::null(),
+        let mut attr: SpawnAttr = ptr::null_mut();
+        if posix_spawnattr_init(&mut attr) != 0 {
+            eputs(b"pstramp: posix_spawnattr_init failed\n");
+            return 1;
+        }
+        if posix_spawnattr_setflags(&mut attr, POSIX_SPAWN_DISCLAIM | POSIX_SPAWN_SETEXEC) != 0 {
+            posix_spawnattr_destroy(&mut attr);
+            eputs(b"pstramp: posix_spawnattr_setflags failed\n");
+            return 1;
+        }
+        // SETEXEC replaces the current process; should not return on success.
+        posix_spawn(
+            ptr::null_mut(),
+            *cmd_argv,
+            ptr::null(),
             &attr,
-            c_argv.as_ptr(),
-            *libc::_NSGetEnviron(),
-        )
-    };
+            cmd_argv,
+            *_NSGetEnviron(),
+        );
+        posix_spawnattr_destroy(&mut attr);
+        eputs(b"pstramp: posix_spawn failed\n");
+        return 1;
+    }
 
-    // posix_spawn with SETEXEC should not return on success.
-    unsafe { libc::posix_spawnattr_destroy(&mut attr) };
-    format!("posix_spawn: {}", os_error(ret))
+    // Default: plain execvp.
+    execvp(*cmd_argv, cmd_argv);
+    eputs(b"pstramp: exec failed\n");
+    1
 }
 
-/// Plain execvp — replaces the current process.
-fn exec(argv: &[String]) -> std::io::Error {
-    let program = CString::new(argv[0].as_bytes()).expect("program name contains nul");
-    let c_args: Vec<CString> = argv
-        .iter()
-        .map(|a| CString::new(a.as_bytes()).expect("argument contains nul"))
-        .collect();
-    let c_argv: Vec<*const libc::c_char> = c_args
-        .iter()
-        .map(|s| s.as_ptr())
-        .chain(std::iter::once(std::ptr::null()))
-        .collect();
-
-    // SAFETY: execvp replaces the process; only returns on error.
-    unsafe { libc::execvp(program.as_ptr(), c_argv.as_ptr()) };
-    std::io::Error::last_os_error()
-}
-
-fn to_cstring(s: &str) -> Result<CString, String> {
-    CString::new(s.as_bytes()).map_err(|_| format!("argument contains nul byte: {s}"))
-}
-
-fn os_error(errno: libc::c_int) -> String {
-    std::io::Error::from_raw_os_error(errno).to_string()
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! {
+    unsafe { exit(1) }
 }
