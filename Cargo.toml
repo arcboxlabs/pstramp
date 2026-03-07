@@ -11,6 +11,9 @@ repository = "https://github.com/arcboxlabs/pstramp"
 name = "pstramp"
 path = "src/main.rs"
 
+[profile.dev]
+panic = "abort"
+
 [profile.release]
 opt-level = "z"
 lto = true

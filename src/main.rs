@@ -156,3 +156,7 @@ pub unsafe extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int 
 fn panic(_: &core::panic::PanicInfo) -> ! {
     unsafe { exit(1) }
 }
+
+// Stub for precompiled core's unwind references (dead-stripped in release via LTO).
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_eh_personality() {}
