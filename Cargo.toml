@@ -1,0 +1,21 @@
+[package]
+name = "pstramp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Process spawn trampoline for session/terminal setup and responsibility disclaiming"
+repository = "https://github.com/arcboxd/pstramp"
+
+[[bin]]
+name = "pstramp"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
