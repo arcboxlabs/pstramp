@@ -111,10 +111,12 @@ pub unsafe extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int 
     // -setctty: new session + claim stdin as controlling terminal.
     if do_setctty {
         if setsid() == -1 {
-            eputs(b"pstramp: setsid failed\n");
-            return 1;
-        }
-        if ioctl(0, TIOCSCTTY, 0 as c_int) == -1 {
+            // setsid() fails with EPERM when we are already a process group
+            // leader (PID == PGID).  This happens when Foundation / NSTask
+            // spawns us with POSIX_SPAWN_SETPGROUP.  Proceed without session
+            // isolation — terminal I/O is unaffected, only Ctrl-C signal
+            // routing may differ.
+        } else if ioctl(0, TIOCSCTTY, 0 as c_int) == -1 {
             eputs(b"pstramp: ioctl TIOCSCTTY failed\n");
             return 1;
         }
