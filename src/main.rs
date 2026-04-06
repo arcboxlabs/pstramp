@@ -3,6 +3,12 @@
 //! Lightweight helper for process isolation. Performs optional session and
 //! controlling-terminal setup, then exec()s into the requested command.
 //!
+//! When spawned by Foundation's `Process()` (which uses `POSIX_SPAWN_SETPGROUP`),
+//! the trampoline is already a process group leader (PID == PGID), so `setsid()`
+//! would fail with EPERM. To work around this, `-setctty` forks a child process
+//! first — the child has a fresh PID != PGID, so `setsid()` succeeds, and the
+//! PTY replica on stdin becomes the controlling terminal via `TIOCSCTTY`.
+//!
 //! # Usage
 //!
 //! ```text
@@ -11,8 +17,9 @@
 //!
 //! # Flags
 //!
-//! - `-setctty`  — Create a new session (`setsid`) and claim stdin as the
-//!   controlling terminal (`TIOCSCTTY`).
+//! - `-setctty`  — Fork, create a new session (`setsid`) in the child, and
+//!   claim stdin as the controlling terminal (`TIOCSCTTY`). The parent waits
+//!   and forwards the child's exit status.
 //! - `-disclaim` — Use `posix_spawn` with `POSIX_SPAWN_DISCLAIM` to relinquish
 //!   the parent's responsibility claims.
 
@@ -37,6 +44,7 @@ type SpawnAttr = *mut c_void;
 
 #[link(name = "System", kind = "dylib")]
 unsafe extern "C" {
+    fn fork() -> c_int;
     fn setsid() -> c_int;
     fn ioctl(fd: c_int, request: u64, ...) -> c_int;
     fn execvp(file: *const c_char, argv: *const *const c_char) -> c_int;
@@ -44,6 +52,7 @@ unsafe extern "C" {
     fn strcmp(s1: *const c_char, s2: *const c_char) -> c_int;
     fn strlen(s: *const c_char) -> usize;
     fn exit(status: c_int) -> !;
+    fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
 
     fn posix_spawnattr_init(attr: *mut SpawnAttr) -> c_int;
     fn posix_spawnattr_setflags(attr: *mut SpawnAttr, flags: c_short) -> c_int;
@@ -58,6 +67,9 @@ unsafe extern "C" {
     ) -> c_int;
 
     fn _NSGetEnviron() -> *const *const *const c_char;
+
+    // macOS errno access: returns pointer to thread-local errno.
+    fn __error() -> *mut c_int;
 }
 
 unsafe fn eputs(s: &[u8]) {
@@ -108,15 +120,42 @@ pub unsafe extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int 
 
     let cmd_argv = argv.offset(cmd_start as isize);
 
-    // -setctty: new session + claim stdin as controlling terminal.
+    // -setctty: fork so the child gets a fresh PID != PGID, then setsid +
+    // TIOCSCTTY in the child.  The parent waits and forwards the exit status.
+    //
+    // Why fork?  Foundation's Process() uses POSIX_SPAWN_SETPGROUP, making us
+    // a process group leader (PID == PGID).  setsid() requires PID != PGID.
+    // Forking gives the child a new PID while inheriting our PGID, so setsid()
+    // succeeds and the PTY replica on stdin becomes the controlling terminal.
     if do_setctty {
+        let pid = fork();
+        if pid == -1 {
+            eputs(b"pstramp: fork failed\n");
+            return 1;
+        }
+        if pid > 0 {
+            // Parent: wait for the child and forward its exit status.
+            let mut status: c_int = 0;
+            loop {
+                let ret = waitpid(pid, &mut status, 0);
+                if ret != -1 { break; }
+                // EINTR (4) — retry; any other errno — give up.
+                if *__error() != 4 {
+                    return 1;
+                }
+            }
+            // If child exited normally, use its exit code; otherwise 1.
+            if (status & 0x7f) == 0 {
+                return (status >> 8) & 0xff;
+            }
+            return 1;
+        }
+        // Child: new session + controlling terminal.
         if setsid() == -1 {
-            // setsid() fails with EPERM when we are already a process group
-            // leader (PID == PGID).  This happens when Foundation / NSTask
-            // spawns us with POSIX_SPAWN_SETPGROUP.  Proceed without session
-            // isolation — terminal I/O is unaffected, only Ctrl-C signal
-            // routing may differ.
-        } else if ioctl(0, TIOCSCTTY, 0 as c_int) == -1 {
+            eputs(b"pstramp: setsid failed\n");
+            return 1;
+        }
+        if ioctl(0, TIOCSCTTY, 0 as c_int) == -1 {
             eputs(b"pstramp: ioctl TIOCSCTTY failed\n");
             return 1;
         }
